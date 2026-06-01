@@ -20,33 +20,105 @@ export interface FilterOptions {
   jobTitles: string[];
 }
 
+/**
+ * Collect the distinct non-null values for one or more columns of a table.
+ *
+ * Supabase enforces a hard per-request row cap (1000 on this project), so a
+ * single `.select()` only sees the first page of rows — any value that appears
+ * solely in later rows is silently dropped from the resulting list. We page
+ * through the table with `.range()` so the distinct sets are complete.
+ *
+ * `maxPages` bounds the scan: small lookup tables (person_campaigns, ~5k rows)
+ * pass a high cap to scan everything; huge tables (people, ~566k rows) MUST
+ * cap to a page or two, otherwise a full scan is hundreds of sequential
+ * requests (~1s each). For a complete distinct list over a large table, add a
+ * server-side DISTINCT RPC instead — see getFilterOptions notes.
+ *
+ * When more than one page is needed, the first request also asks for the exact
+ * row count so the remaining pages can be fetched in parallel rather than
+ * sequentially (each Supabase round-trip is ~0.5-1s of latency). The exact
+ * count is only requested in the multi-page case — a count over a 566k-row
+ * table is itself slow, so the single-page sample path stays count-free.
+ */
+async function collectDistinct<K extends string>(
+  table: string,
+  columns: readonly K[],
+  maxPages: number
+): Promise<Record<K, Set<string>>> {
+  const PAGE = 1000;
+  const cols = columns.join(",");
+  const sets = Object.fromEntries(columns.map((c) => [c, new Set<string>()])) as Record<K, Set<string>>;
+
+  const ingest = (data: unknown) => {
+    for (const row of (data ?? []) as Record<string, unknown>[]) {
+      for (const col of columns) {
+        const v = row[col];
+        if (v) sets[col].add(v as string);
+      }
+    }
+  };
+
+  // First page. Request a count only when we may need to fan out (maxPages > 1).
+  const first = maxPages > 1
+    ? await supabase.from(table).select(cols, { count: "exact" }).range(0, PAGE - 1)
+    : await supabase.from(table).select(cols).range(0, PAGE - 1);
+  if (first.error) throw first.error;
+  ingest(first.data);
+
+  // Fan out the remaining pages in parallel based on the known total.
+  const total = first.count ?? 0;
+  const pages = Math.min(maxPages, Math.ceil(total / PAGE));
+  if (pages > 1) {
+    const rest = await Promise.all(
+      Array.from({ length: pages - 1 }, (_, i) => {
+        const from = (i + 1) * PAGE;
+        return supabase.from(table).select(cols).range(from, from + PAGE - 1);
+      })
+    );
+    for (const r of rest) {
+      if (r.error) throw r.error;
+      ingest(r.data);
+    }
+  }
+
+  return sets;
+}
+
+// In-memory cache: distinct values change rarely, but computing them hits the
+// DB hard. Cache for the server instance's lifetime up to the TTL so refreshes
+// don't recompute. (Module-level => shared across requests on the same server.)
+let _filterCache: { at: number; val: FilterOptions } | null = null;
+const FILTER_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 /** Fetch filter options: distinct values for selector-based filters */
 export async function getFilterOptions(): Promise<FilterOptions> {
+  if (_filterCache && Date.now() - _filterCache.at < FILTER_TTL_MS) {
+    return _filterCache.val;
+  }
   try {
-    const [campaignsRes, clientsRes, statusesRes, espRes, tzRes, countryRes, industryRes, jobTitleRes] = await Promise.all([
-      supabase.from("person_campaigns").select("campaign_name").not("campaign_name", "is", null),
-      supabase.from("person_campaigns").select("esp_client_name").not("esp_client_name", "is", null),
-      supabase.from("person_campaigns").select("status").not("status", "is", null),
-      supabase.from("people").select("esp").not("esp", "is", null),
-      supabase.from("people").select("timezone").not("timezone", "is", null),
-      supabase.from("people").select("lead_location").not("lead_location", "is", null),
-      supabase.from("people").select("industry").not("industry", "is", null),
-      supabase.from("people").select("job_title").not("job_title", "is", null),
+    const [pc, people] = await Promise.all([
+      // person_campaigns is ~5k rows: scan fully so every client/campaign/status shows.
+      collectDistinct("person_campaigns", ["campaign_name", "esp_client_name", "status"] as const, 50),
+      // people is ~566k rows: a full scan is ~600s, so sample the first page only.
+      // Suggestions are best-effort here (the filter also accepts free-typed values);
+      // for a complete list, back these with a DISTINCT RPC.
+      collectDistinct("people", ["esp", "timezone", "lead_location", "industry", "job_title"] as const, 1),
     ]);
 
-    const unique = (data: Record<string, unknown>[] | null, key: string) =>
-      [...new Set((data ?? []).map((r) => r[key] as string).filter(Boolean))].sort();
+    const sorted = (s: Set<string>) => [...s].sort();
 
-    return {
-      campaigns: unique(campaignsRes.data, "campaign_name"),
-      clients: unique(clientsRes.data, "esp_client_name"),
-      statuses: unique(statusesRes.data, "status"),
-      esps: unique(espRes.data, "esp"),
-      timezones: unique(tzRes.data, "timezone"),
-      countries: unique(countryRes.data, "lead_location"),
-      industries: unique(industryRes.data, "industry"),
-      jobTitles: unique(jobTitleRes.data, "job_title"),
+    const val: FilterOptions = {
+      campaigns: sorted(pc.campaign_name),
+      clients: sorted(pc.esp_client_name),
+      statuses: sorted(pc.status),
+      esps: sorted(people.esp),
+      timezones: sorted(people.timezone),
+      countries: sorted(people.lead_location),
+      industries: sorted(people.industry),
+      jobTitles: sorted(people.job_title),
     };
+    _filterCache = { at: Date.now(), val };
+    return val;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("Missing env")) throw err;

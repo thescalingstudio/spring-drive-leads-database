@@ -28,8 +28,15 @@ export async function inviteUser(email: string, role: ProfileRole = "user") {
     throw new Error(insertError.message);
   }
 
+  const siteUrl =
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    (process.env.NEXT_PUBLIC_VERCEL_URL
+      ? `https://${process.env.NEXT_PUBLIC_VERCEL_URL}`
+      : "http://localhost:3000");
+
   const { error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
-    normalizedEmail
+    normalizedEmail,
+    { redirectTo: siteUrl }
   );
   if (inviteError) {
     // Remove pending invite if invite failed (e.g. already a user)
